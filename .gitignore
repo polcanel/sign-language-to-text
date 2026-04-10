@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Local model artifacts
+models/*.joblib
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/src/**/*.tsbuildinfo
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+
+# Large local datasets (keep out of git)
+keypoints_100/
+slovo_keypoints/
+
+*.ipynb
