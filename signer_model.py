@@ -31,12 +31,14 @@ TTA_FRAME_SHIFTS = (-4, -2, 0, 2, 4)
 LSTM_HIDDEN_SIZE = 192
 LSTM_LAYERS = 2
 LSTM_DROPOUT = 0.25
-TRAIN_BATCH_SIZE = 64
-TRAIN_MAX_EPOCHS = 60
+TRAIN_BATCH_SIZE = 48
+TRAIN_MAX_EPOCHS = 80
 TRAIN_PATIENCE = 10
 TRAIN_LR = 1e-3
 TRAIN_WEIGHT_DECAY = 1e-4
 VALIDATION_SIZE = 0.15
+TRAIN_LABEL_SMOOTHING = 0.05
+TRAIN_GRAD_CLIP_NORM = 1.0
 
 
 @dataclass
@@ -67,17 +69,20 @@ class LSTMSequenceClassifier(nn.Module):
             batch_first=True,
             bidirectional=True,
         )
+        pooled_size = hidden_size * 4
         self.head = nn.Sequential(
-            nn.LayerNorm(hidden_size * 2),
-            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LayerNorm(pooled_size),
+            nn.Linear(pooled_size, hidden_size * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size, num_classes),
+            nn.Linear(hidden_size * 2, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, _ = self.lstm(x)
-        pooled = out.mean(dim=1)
+        pooled_mean = out.mean(dim=1)
+        pooled_max = out.max(dim=1).values
+        pooled = torch.cat([pooled_mean, pooled_max], dim=1)
         return self.head(pooled)
 
 
@@ -189,7 +194,8 @@ class SignTranslatorModel:
         class_weights = class_counts.sum() / (num_classes * class_counts)
 
         criterion = nn.CrossEntropyLoss(
-            weight=torch.tensor(class_weights, dtype=torch.float32, device=self._device)
+            weight=torch.tensor(class_weights, dtype=torch.float32, device=self._device),
+            label_smoothing=TRAIN_LABEL_SMOOTHING,
         )
         optimizer = torch.optim.AdamW(model.parameters(), lr=TRAIN_LR, weight_decay=TRAIN_WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -223,6 +229,7 @@ class SignTranslatorModel:
                 logits = model(batch_x)
                 loss = criterion(logits, batch_y)
                 loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=TRAIN_GRAD_CLIP_NORM)
                 optimizer.step()
 
             model.eval()
@@ -469,15 +476,27 @@ class SignTranslatorModel:
             noise = rng.normal(loc=0.0, scale=0.01, size=X.shape).astype(np.float32)
             scale = rng.uniform(0.92, 1.08, size=(X.shape[0], 1, 1)).astype(np.float32)
 
-            temporal_shift = int(rng.integers(-4, 5))
             shifted = X.copy()
-            if temporal_shift > 0:
-                pad = np.repeat(shifted[:, :1, :], temporal_shift, axis=1)
-                shifted = np.concatenate([pad, shifted[:, :-temporal_shift, :]], axis=1)
-            elif temporal_shift < 0:
-                trailing = abs(temporal_shift)
-                pad = np.repeat(shifted[:, -1:, :], trailing, axis=1)
-                shifted = np.concatenate([shifted[:, trailing:, :], pad], axis=1)
+            shifts = rng.integers(-4, 5, size=shifted.shape[0])
+
+            for sample_i, temporal_shift in enumerate(shifts):
+                shift = int(temporal_shift)
+                if shift > 0:
+                    pad = np.repeat(shifted[sample_i : sample_i + 1, :1, :], shift, axis=1)
+                    shifted[sample_i : sample_i + 1] = np.concatenate(
+                        [pad, shifted[sample_i : sample_i + 1, :-shift, :]],
+                        axis=1,
+                    )
+                elif shift < 0:
+                    trailing = abs(shift)
+                    pad = np.repeat(shifted[sample_i : sample_i + 1, -1:, :], trailing, axis=1)
+                    shifted[sample_i : sample_i + 1] = np.concatenate(
+                        [shifted[sample_i : sample_i + 1, trailing:, :], pad],
+                        axis=1,
+                    )
+
+                if float(rng.random()) < 0.5:
+                    shifted[sample_i] = SignTranslatorModel._mirror_sequence_features(shifted[sample_i])
 
             variant = shifted
             variant = variant * scale
@@ -487,6 +506,39 @@ class SignTranslatorModel:
             augmented_y.append(y)
 
         return np.vstack(augmented_x), np.concatenate(augmented_y)
+
+    @staticmethod
+    def _mirror_sequence_features(sequence_features: np.ndarray) -> np.ndarray:
+        arr = np.array(sequence_features, dtype=np.float32, copy=True)
+        if arr.ndim != 2:
+            return arr
+
+        hand_dim = NUM_LANDMARKS * NUM_COORDS
+        pos_dim = NUM_HANDS * hand_dim
+        if arr.shape[1] != pos_dim * 2:
+            return arr
+
+        x_idx = np.arange(0, hand_dim, NUM_COORDS)
+
+        pos = arr[:, :pos_dim].copy()
+        vel = arr[:, pos_dim:].copy()
+
+        pos_left = pos[:, :hand_dim].copy()
+        pos_right = pos[:, hand_dim:].copy()
+        vel_left = vel[:, :hand_dim].copy()
+        vel_right = vel[:, hand_dim:].copy()
+
+        pos[:, :hand_dim] = pos_right
+        pos[:, hand_dim:] = pos_left
+        vel[:, :hand_dim] = vel_right
+        vel[:, hand_dim:] = vel_left
+
+        pos[:, x_idx] *= -1.0
+        pos[:, hand_dim + x_idx] *= -1.0
+        vel[:, x_idx] *= -1.0
+        vel[:, hand_dim + x_idx] *= -1.0
+
+        return np.concatenate([pos, vel], axis=1).astype(np.float32)
 
     def _read_annotations(self) -> pd.DataFrame:
         for encoding in ("utf-8", "utf-8-sig", "cp1251"):
