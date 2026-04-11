@@ -9,11 +9,12 @@ import joblib
 import mediapipe as mp
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelEncoder
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 SEQUENCE_LENGTH = 155
 NUM_HANDS = 2
@@ -21,11 +22,21 @@ NUM_LANDMARKS = 21
 NUM_COORDS = 3
 FEATURE_SHAPE = (SEQUENCE_LENGTH, NUM_HANDS, NUM_LANDMARKS, NUM_COORDS)
 MIN_HAND_ACTIVITY_RATIO = 0.01
-AUGMENT_REPEATS = 0
+AUGMENT_REPEATS = 2
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 10
 UNSURE_CONFIDENCE_THRESHOLD = 0.20
 TTA_FRAME_SHIFTS = (-4, -2, 0, 2, 4)
+
+LSTM_HIDDEN_SIZE = 192
+LSTM_LAYERS = 2
+LSTM_DROPOUT = 0.25
+TRAIN_BATCH_SIZE = 64
+TRAIN_MAX_EPOCHS = 60
+TRAIN_PATIENCE = 10
+TRAIN_LR = 1e-3
+TRAIN_WEIGHT_DECAY = 1e-4
+VALIDATION_SIZE = 0.15
 
 
 @dataclass
@@ -36,6 +47,38 @@ class TrainResult:
     test_accuracy: float
     total_matched_samples: int
     skipped_non_letters: int
+
+
+class LSTMSequenceClassifier(nn.Module):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int,
+        num_classes: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size * 2),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out, _ = self.lstm(x)
+        pooled = out.mean(dim=1)
+        return self.head(pooled)
 
 
 class SignTranslatorModel:
@@ -51,8 +94,12 @@ class SignTranslatorModel:
         self.model_path = Path(model_path)
         self.encoder_path = Path(encoder_path)
 
-        self.model: Pipeline | None = None
+        self.model: LSTMSequenceClassifier | None = None
         self.label_encoder: LabelEncoder | None = None
+        self._feature_mean: np.ndarray | None = None
+        self._feature_std: np.ndarray | None = None
+        self._input_size: int | None = None
+        self._device = torch.device("cpu")
 
         self._mp_hands = mp.solutions.hands
 
@@ -60,7 +107,25 @@ class SignTranslatorModel:
         if not self.model_path.exists() or not self.encoder_path.exists():
             return False
 
-        self.model = joblib.load(self.model_path)
+        checkpoint = torch.load(self.model_path, map_location=self._device, weights_only=False)
+        input_size = int(checkpoint["input_size"])
+        num_classes = int(checkpoint["num_classes"])
+
+        model = LSTMSequenceClassifier(
+            input_size=input_size,
+            hidden_size=int(checkpoint["hidden_size"]),
+            num_layers=int(checkpoint["num_layers"]),
+            num_classes=num_classes,
+            dropout=float(checkpoint["dropout"]),
+        )
+        model.load_state_dict(checkpoint["state_dict"])
+        model.to(self._device)
+        model.eval()
+
+        self.model = model
+        self._feature_mean = np.array(checkpoint["feature_mean"], dtype=np.float32)
+        self._feature_std = np.array(checkpoint["feature_std"], dtype=np.float32)
+        self._input_size = input_size
         self.label_encoder = joblib.load(self.encoder_path)
         return True
 
@@ -78,45 +143,137 @@ class SignTranslatorModel:
             stratify=y_text,
         )
 
-        X_train, y_train_text = self._augment_flat_samples(
+        X_train, y_train_aug_text = self._augment_sequence_samples(
             X_train_raw,
             y_train_text,
             repeats=AUGMENT_REPEATS,
         )
 
-        label_encoder = LabelEncoder()
-        label_encoder.fit(y_text)
-        y_train = label_encoder.transform(y_train_text)
-        y_test = label_encoder.transform(y_test_text)
-
-        pipeline = Pipeline(
-            steps=[
-                ("scaler", StandardScaler()),
-                (
-                    "clf",
-                    ExtraTreesClassifier(
-                        n_estimators=1200,
-                        class_weight="balanced",
-                        random_state=42,
-                        n_jobs=-1,
-                    ),
-                ),
-            ]
+        X_fit, X_val, y_fit_text, y_val_text = train_test_split(
+            X_train,
+            y_train_aug_text,
+            test_size=VALIDATION_SIZE,
+            random_state=42,
+            stratify=y_train_aug_text,
         )
 
-        pipeline.fit(X_train, y_train)
+        label_encoder = LabelEncoder()
+        label_encoder.fit(y_text)
+        y_fit = label_encoder.transform(y_fit_text)
+        y_val = label_encoder.transform(y_val_text)
+        y_train = label_encoder.transform(y_train_aug_text)
+        y_test = label_encoder.transform(y_test_text)
 
-        train_pred = pipeline.predict(X_train)
-        test_pred = pipeline.predict(X_test)
+        feature_mean = X_fit.reshape(-1, X_fit.shape[-1]).mean(axis=0).astype(np.float32)
+        feature_std = X_fit.reshape(-1, X_fit.shape[-1]).std(axis=0).astype(np.float32)
+        feature_std = np.where(feature_std < 1e-6, 1.0, feature_std).astype(np.float32)
+
+        X_fit_norm = ((X_fit - feature_mean) / feature_std).astype(np.float32)
+        X_val_norm = ((X_val - feature_mean) / feature_std).astype(np.float32)
+        X_train_norm = ((X_train - feature_mean) / feature_std).astype(np.float32)
+        X_test_norm = ((X_test - feature_mean) / feature_std).astype(np.float32)
+
+        num_classes = len(label_encoder.classes_)
+        input_size = int(X_train_norm.shape[-1])
+
+        model = LSTMSequenceClassifier(
+            input_size=input_size,
+            hidden_size=LSTM_HIDDEN_SIZE,
+            num_layers=LSTM_LAYERS,
+            num_classes=num_classes,
+            dropout=LSTM_DROPOUT,
+        ).to(self._device)
+
+        class_counts = np.bincount(y_fit, minlength=num_classes).astype(np.float32)
+        class_counts = np.maximum(class_counts, 1.0)
+        class_weights = class_counts.sum() / (num_classes * class_counts)
+
+        criterion = nn.CrossEntropyLoss(
+            weight=torch.tensor(class_weights, dtype=torch.float32, device=self._device)
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=TRAIN_LR, weight_decay=TRAIN_WEIGHT_DECAY)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=4,
+            min_lr=1e-5,
+        )
+
+        fit_dataset = TensorDataset(
+            torch.tensor(X_fit_norm, dtype=torch.float32),
+            torch.tensor(y_fit, dtype=torch.long),
+        )
+        fit_loader = DataLoader(fit_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True)
+
+        X_val_tensor = torch.tensor(X_val_norm, dtype=torch.float32, device=self._device)
+        y_val_tensor = torch.tensor(y_val, dtype=torch.long, device=self._device)
+
+        best_val_accuracy = -1.0
+        best_state: dict | None = None
+        epochs_without_improvement = 0
+
+        for _ in range(TRAIN_MAX_EPOCHS):
+            model.train()
+            for batch_x, batch_y in fit_loader:
+                batch_x = batch_x.to(self._device)
+                batch_y = batch_y.to(self._device)
+
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(batch_x)
+                loss = criterion(logits, batch_y)
+                loss.backward()
+                optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_logits = model(X_val_tensor)
+                val_pred = torch.argmax(val_logits, dim=1)
+                val_accuracy = float((val_pred == y_val_tensor).float().mean().item())
+
+            scheduler.step(val_accuracy)
+
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if epochs_without_improvement >= TRAIN_PATIENCE:
+                    break
+
+        if best_state is None:
+            raise ValueError("LSTM training failed to produce a valid checkpoint.")
+
+        model.load_state_dict(best_state)
+        model.eval()
+
+        train_pred = self._predict_classes(model, X_train_norm)
+        test_pred = self._predict_classes(model, X_test_norm)
 
         train_accuracy = accuracy_score(y_train, train_pred)
         test_accuracy = accuracy_score(y_test, test_pred)
 
-        self.model = pipeline
+        self.model = model
         self.label_encoder = label_encoder
+        self._feature_mean = feature_mean
+        self._feature_std = feature_std
+        self._input_size = input_size
 
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(self.model, self.model_path)
+        torch.save(
+            {
+                "state_dict": self.model.state_dict(),
+                "input_size": input_size,
+                "hidden_size": LSTM_HIDDEN_SIZE,
+                "num_layers": LSTM_LAYERS,
+                "dropout": LSTM_DROPOUT,
+                "num_classes": num_classes,
+                "feature_mean": feature_mean,
+                "feature_std": feature_std,
+            },
+            self.model_path,
+        )
         joblib.dump(self.label_encoder, self.encoder_path)
 
         return TrainResult(
@@ -160,10 +317,29 @@ class SignTranslatorModel:
         probs: List[np.ndarray] = []
         for shift in TTA_FRAME_SHIFTS:
             shifted = self._shift_sequence(keypoints, shift)
-            features = self._extract_features(shifted)
-            probs.append(self.model.predict_proba(features)[0])
+            features = self._extract_sequence_features(shifted)
+            probs.append(self._predict_probabilities(features))
 
         return np.mean(np.stack(probs, axis=0), axis=0)
+
+    def _predict_probabilities(self, sequence_features: np.ndarray) -> np.ndarray:
+        if self.model is None or self._feature_mean is None or self._feature_std is None:
+            raise ValueError("Model is not loaded.")
+
+        normalized = ((sequence_features - self._feature_mean) / self._feature_std).astype(np.float32)
+        x_tensor = torch.tensor(normalized[None, ...], dtype=torch.float32, device=self._device)
+
+        with torch.no_grad():
+            logits = self.model(x_tensor)
+            probs = torch.softmax(logits, dim=1)[0].cpu().numpy().astype(np.float32)
+
+        return probs
+
+    def _predict_classes(self, model: LSTMSequenceClassifier, X_seq: np.ndarray) -> np.ndarray:
+        x_tensor = torch.tensor(X_seq, dtype=torch.float32, device=self._device)
+        with torch.no_grad():
+            logits = model(x_tensor)
+            return torch.argmax(logits, dim=1).cpu().numpy()
 
     def predict_from_video(
         self,
@@ -264,7 +440,7 @@ class SignTranslatorModel:
 
             # Align shape if needed.
             keypoints = self._coerce_shape(keypoints)
-            X_list.append(self._extract_features(keypoints)[0])
+            X_list.append(self._extract_sequence_features(keypoints))
             y_list.append(label)
 
         if not X_list:
@@ -275,7 +451,7 @@ class SignTranslatorModel:
         return X, y, total_matched_samples, skipped_non_letters
 
     @staticmethod
-    def _augment_flat_samples(
+    def _augment_sequence_samples(
         X: np.ndarray,
         y: np.ndarray,
         repeats: int = 4,
@@ -290,10 +466,20 @@ class SignTranslatorModel:
         non_zero_mask = X != 0
 
         for _ in range(repeats):
-            noise = rng.normal(loc=0.0, scale=0.008, size=X.shape).astype(np.float32)
-            scale = rng.uniform(0.92, 1.08, size=(X.shape[0], 1)).astype(np.float32)
+            noise = rng.normal(loc=0.0, scale=0.01, size=X.shape).astype(np.float32)
+            scale = rng.uniform(0.92, 1.08, size=(X.shape[0], 1, 1)).astype(np.float32)
 
-            variant = X.copy()
+            temporal_shift = int(rng.integers(-4, 5))
+            shifted = X.copy()
+            if temporal_shift > 0:
+                pad = np.repeat(shifted[:, :1, :], temporal_shift, axis=1)
+                shifted = np.concatenate([pad, shifted[:, :-temporal_shift, :]], axis=1)
+            elif temporal_shift < 0:
+                trailing = abs(temporal_shift)
+                pad = np.repeat(shifted[:, -1:, :], trailing, axis=1)
+                shifted = np.concatenate([shifted[:, trailing:, :], pad], axis=1)
+
+            variant = shifted
             variant = variant * scale
             variant = variant + noise * non_zero_mask
 
@@ -396,27 +582,13 @@ class SignTranslatorModel:
 
         return arr
 
-    def _extract_features(self, keypoints: np.ndarray) -> np.ndarray:
+    def _extract_sequence_features(self, keypoints: np.ndarray) -> np.ndarray:
         normalized = self._normalize_sequence(keypoints)
 
         velocity = np.diff(normalized, axis=0, prepend=normalized[:1])
-        speed = np.linalg.norm(velocity, axis=-1, keepdims=True)
-
-        mean_pos = normalized.mean(axis=0).reshape(-1)
-        std_pos = normalized.std(axis=0).reshape(-1)
-        mean_speed = speed.mean(axis=0).reshape(-1)
-
-        flat = np.concatenate(
-            [
-                normalized.reshape(-1),
-                velocity.reshape(-1),
-                speed.reshape(-1),
-                mean_pos,
-                std_pos,
-                mean_speed,
-            ]
-        ).astype(np.float32)
-        return flat.reshape(1, -1)
+        seq = normalized.reshape(normalized.shape[0], -1)
+        vel_seq = velocity.reshape(velocity.shape[0], -1)
+        return np.concatenate([seq, vel_seq], axis=1).astype(np.float32)
 
     @staticmethod
     def _flatten_keypoints(keypoints: np.ndarray) -> np.ndarray:
@@ -426,7 +598,12 @@ class SignTranslatorModel:
         return arr.reshape(1, -1)
 
     def _ensure_loaded(self) -> None:
-        if self.model is None or self.label_encoder is None:
+        if (
+            self.model is None
+            or self.label_encoder is None
+            or self._feature_mean is None
+            or self._feature_std is None
+        ):
             if not self.load_if_exists():
                 raise ValueError(
                     "Model is not trained yet. Call /api/train first or run train script."
