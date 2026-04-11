@@ -184,7 +184,7 @@ export function App() {
         </p>
         <div className="status">Backend: {health?.status || "..."} | {statusLabel}</div>
         <button className="button--accent" disabled={isTraining || isPredicting} onClick={() => void handleTrain()}>
-          {isTraining ? "Training model..." : "Train model (letters only)"}
+          {isTraining ? "Training model..." : "Train model"}
         </button>
       </header>
 

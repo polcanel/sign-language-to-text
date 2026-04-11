@@ -107,12 +107,12 @@ body {
 
 .controls {
   display: flex;
-  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 10px;
 
   button {
-    min-width: 150px;
+    flex: 1;  
+    min-width: 0;  
   }
 }
 
@@ -172,6 +172,7 @@ button {
 }
 
 .button--accent {
+  width: 100%;
   background: var(--accent);
 }
 
