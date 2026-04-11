@@ -9,9 +9,8 @@ import joblib
 import mediapipe as mp
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.metrics import accuracy_score
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -22,7 +21,7 @@ NUM_LANDMARKS = 21
 NUM_COORDS = 3
 FEATURE_SHAPE = (SEQUENCE_LENGTH, NUM_HANDS, NUM_LANDMARKS, NUM_COORDS)
 MIN_HAND_ACTIVITY_RATIO = 0.01
-AUGMENT_REPEATS = 4
+AUGMENT_REPEATS = 0
 
 
 @dataclass
@@ -91,21 +90,11 @@ class SignTranslatorModel:
                 ("scaler", StandardScaler()),
                 (
                     "clf",
-                    Pipeline(
-                        steps=[
-                            (
-                                "pca",
-                                PCA(n_components=0.98, svd_solver="full", random_state=42),
-                            ),
-                            (
-                                "lr",
-                                LogisticRegression(
-                                    max_iter=1500,
-                                    class_weight="balanced",
-                                    solver="lbfgs",
-                                ),
-                            ),
-                        ]
+                    ExtraTreesClassifier(
+                        n_estimators=1200,
+                        class_weight="balanced",
+                        random_state=42,
+                        n_jobs=-1,
                     ),
                 ),
             ]
@@ -138,9 +127,9 @@ class SignTranslatorModel:
     def predict_from_keypoints(self, keypoints: np.ndarray) -> Tuple[str, float]:
         self._ensure_loaded()
         self._ensure_has_hand_activity(keypoints)
-        flat = self._flatten_keypoints(keypoints)
+        features = self._extract_features(keypoints)
 
-        probabilities = self.model.predict_proba(flat)[0]
+        probabilities = self.model.predict_proba(features)[0]
         class_idx = int(np.argmax(probabilities))
         label = self.label_encoder.inverse_transform([class_idx])[0]
         confidence = float(probabilities[class_idx])
@@ -241,7 +230,7 @@ class SignTranslatorModel:
 
             # Align shape if needed.
             keypoints = self._coerce_shape(keypoints)
-            X_list.append(self._flatten_keypoints(keypoints)[0])
+            X_list.append(self._extract_features(keypoints)[0])
             y_list.append(label)
 
         if not X_list:
@@ -313,6 +302,69 @@ class SignTranslatorModel:
         indices = np.linspace(0, len(frames) - 1, target_len).astype(int)
         sampled = np.stack([frames[i] for i in indices]).astype(np.float32)
         return sampled
+
+    @staticmethod
+    def _canonicalize_hands_order(frame_points: np.ndarray) -> np.ndarray:
+        frame = np.array(frame_points, dtype=np.float32, copy=True)
+        if frame.shape != (NUM_HANDS, NUM_LANDMARKS, NUM_COORDS):
+            return frame
+
+        hand0 = frame[0]
+        hand1 = frame[1]
+        if np.count_nonzero(hand0) == 0 or np.count_nonzero(hand1) == 0:
+            return frame
+
+        if hand0[0, 0] > hand1[0, 0]:
+            return np.stack([hand1, hand0], axis=0)
+        return frame
+
+    def _normalize_sequence(self, keypoints: np.ndarray) -> np.ndarray:
+        arr = np.array(keypoints, dtype=np.float32, copy=True)
+        if arr.shape != FEATURE_SHAPE:
+            raise ValueError(f"Expected keypoints shape {FEATURE_SHAPE}, got {arr.shape}")
+
+        for frame_i in range(SEQUENCE_LENGTH):
+            arr[frame_i] = self._canonicalize_hands_order(arr[frame_i])
+
+            for hand_i in range(NUM_HANDS):
+                hand = arr[frame_i, hand_i]
+                if np.count_nonzero(hand) == 0:
+                    continue
+
+                wrist = hand[0].copy()
+                hand -= wrist
+
+                scale = np.linalg.norm(hand[9] - hand[0])
+                if scale < 1e-4:
+                    scale = np.linalg.norm(hand[5] - hand[0])
+                if scale > 1e-4:
+                    hand /= scale
+
+                arr[frame_i, hand_i] = hand
+
+        return arr
+
+    def _extract_features(self, keypoints: np.ndarray) -> np.ndarray:
+        normalized = self._normalize_sequence(keypoints)
+
+        velocity = np.diff(normalized, axis=0, prepend=normalized[:1])
+        speed = np.linalg.norm(velocity, axis=-1, keepdims=True)
+
+        mean_pos = normalized.mean(axis=0).reshape(-1)
+        std_pos = normalized.std(axis=0).reshape(-1)
+        mean_speed = speed.mean(axis=0).reshape(-1)
+
+        flat = np.concatenate(
+            [
+                normalized.reshape(-1),
+                velocity.reshape(-1),
+                speed.reshape(-1),
+                mean_pos,
+                std_pos,
+                mean_speed,
+            ]
+        ).astype(np.float32)
+        return flat.reshape(1, -1)
 
     @staticmethod
     def _flatten_keypoints(keypoints: np.ndarray) -> np.ndarray:
