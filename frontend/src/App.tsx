@@ -223,7 +223,7 @@ export function App() {
           <video className="preview" ref={videoRef} autoPlay playsInline muted />
           <button
             className="button--accent"
-            disabled={isTraining || isPredicting || !recordingBlob}
+            disabled={isTraining || isPredicting || !recordingBlob || isRecording}
             onClick={() => void handlePredictRecording()}
           >
             Predict recording
