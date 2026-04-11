@@ -19,11 +19,12 @@ export async function trainModel(): Promise<TrainResponse> {
   return parseJson<TrainResponse>(response);
 }
 
-export async function predictVideo(file: File): Promise<PredictionResponse> {
+export async function predictVideo(file: File, topK = 5): Promise<PredictionResponse> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch("/api/predict-video", {
+  const safeTopK = Math.max(1, Math.min(10, Math.trunc(topK || 5)));
+  const response = await fetch(`/api/predict-video?top_k=${safeTopK}`, {
     method: "POST",
     body: formData
   });

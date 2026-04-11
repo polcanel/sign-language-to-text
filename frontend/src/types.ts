@@ -6,6 +6,12 @@ export interface HealthResponse {
 export interface PredictionResponse {
   prediction: string;
   confidence: number;
+  top_k?: PredictionCandidate[];
+}
+
+export interface PredictionCandidate {
+  label: string;
+  confidence: number;
 }
 
 export interface TrainResponse {

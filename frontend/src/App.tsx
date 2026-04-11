@@ -13,6 +13,7 @@ export function App() {
 
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [recordingBlob, setRecordingBlob] = useState<Blob | null>(null);
+  const [isCameraActive, setIsCameraActive] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -99,6 +100,7 @@ export function App() {
         audio: false
       });
       streamRef.current = stream;
+      setIsCameraActive(true);
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
@@ -108,10 +110,16 @@ export function App() {
   }
 
   function stopCamera(): void {
+    if (recorderRef.current && isRecording) {
+      recorderRef.current.stop();
+      setIsRecording(false);
+    }
+
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
+    setIsCameraActive(false);
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
@@ -149,6 +157,24 @@ export function App() {
     }
   }
 
+  function toggleCamera(): void {
+    if (isCameraActive) {
+      stopCamera();
+      return;
+    }
+
+    void startCamera();
+  }
+
+  function toggleRecording(): void {
+    if (isRecording) {
+      stopRecording();
+      return;
+    }
+
+    startRecording();
+  }
+
   return (
     <div className="page">
       <header className="hero">
@@ -157,7 +183,7 @@ export function App() {
           Train the model on slovo_keypoints dataset, then upload or record a clip to get text prediction.
         </p>
         <div className="status">Backend: {health?.status || "..."} | {statusLabel}</div>
-        <button disabled={isTraining || isPredicting} onClick={() => void handleTrain()}>
+        <button className="button--accent" disabled={isTraining || isPredicting} onClick={() => void handleTrain()}>
           {isTraining ? "Training model..." : "Train model (letters only)"}
         </button>
       </header>
@@ -171,7 +197,7 @@ export function App() {
             accept="video/*"
             onChange={(event) => setVideoFile(event.target.files?.[0] || null)}
           />
-          <button disabled={isTraining || isPredicting} onClick={() => void handlePredictUpload()}>
+          <button className="button--accent" disabled={isTraining || isPredicting} onClick={() => void handlePredictUpload()}>
             {isPredicting ? "Processing..." : "Predict uploaded video"}
           </button>
         </article>
@@ -180,16 +206,23 @@ export function App() {
           <h2>Record Camera</h2>
           <p>Record 3 to 6 seconds of one gesture, then run prediction.</p>
           <div className="controls">
-            <button onClick={() => void startCamera()} disabled={isRecording}>Start camera</button>
-            <button onClick={stopCamera} disabled={isRecording}>Stop camera</button>
-            {!isRecording ? (
-              <button onClick={startRecording}> 🔴 Start recording</button>
-            ) : (
-              <button onClick={stopRecording}>🟥 Stop recording</button>
-            )}
+            <button
+              className={isCameraActive ? "button button--danger" : "button button--accent"}
+              onClick={toggleCamera}
+            >
+              {isCameraActive ? "Stop camera" : "Start camera"}
+            </button>
+            <button
+              className={isRecording ? "button button--danger" : "button button--accent"}
+              onClick={toggleRecording}
+              disabled={!isCameraActive}
+            >
+              {isRecording ? "Stop recording" : "Start recording"}
+            </button>
           </div>
           <video className="preview" ref={videoRef} autoPlay playsInline muted />
           <button
+            className="button--accent"
             disabled={isTraining || isPredicting || !recordingBlob}
             onClick={() => void handlePredictRecording()}
           >
@@ -205,6 +238,24 @@ export function App() {
           <div>
             {result.prediction.startsWith("✓ Model trained") ? "Test accuracy" : "Confidence"}: {(result.confidence * 100).toFixed(1)}%
           </div>
+          {!!result.top_k?.length && !result.prediction.startsWith("✓ Model trained") && (
+            <div className="topKList">
+              {result.top_k.map((candidate, index) => (
+                <div key={`${candidate.label}-${index}`} className="topKRow">
+                  <div className="topKMeta">
+                    <span>#{index + 1} {candidate.label}</span>
+                    <span>{(candidate.confidence * 100).toFixed(1)}%</span>
+                  </div>
+                  <div className="topKBarTrack">
+                    <div
+                      className="topKBarFill"
+                      style={{ width: `${Math.max(2, candidate.confidence * 100)}%` }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
       )}
 

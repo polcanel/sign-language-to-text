@@ -22,6 +22,10 @@ NUM_COORDS = 3
 FEATURE_SHAPE = (SEQUENCE_LENGTH, NUM_HANDS, NUM_LANDMARKS, NUM_COORDS)
 MIN_HAND_ACTIVITY_RATIO = 0.01
 AUGMENT_REPEATS = 0
+DEFAULT_TOP_K = 5
+MAX_TOP_K = 10
+UNSURE_CONFIDENCE_THRESHOLD = 0.20
+TTA_FRAME_SHIFTS = (-4, -2, 0, 2, 4)
 
 
 @dataclass
@@ -124,20 +128,50 @@ class SignTranslatorModel:
             skipped_non_letters=skipped_non_letters,
         )
 
-    def predict_from_keypoints(self, keypoints: np.ndarray) -> Tuple[str, float]:
+    def predict_top_k_from_keypoints(
+        self,
+        keypoints: np.ndarray,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> List[Tuple[str, float]]:
         self._ensure_loaded()
         self._ensure_has_hand_activity(keypoints)
-        features = self._extract_features(keypoints)
+        top_k = max(1, min(int(top_k), MAX_TOP_K))
 
-        probabilities = self.model.predict_proba(features)[0]
-        class_idx = int(np.argmax(probabilities))
-        label = self.label_encoder.inverse_transform([class_idx])[0]
-        confidence = float(probabilities[class_idx])
-        return label, confidence
+        probabilities = self._predict_probabilities_with_tta(keypoints)
+        top_indices = np.argsort(probabilities)[::-1][:top_k]
 
-    def predict_from_video(self, video_path: str | Path) -> Tuple[str, float]:
+        labels = self.label_encoder.inverse_transform(top_indices)
+        return [(str(label), float(probabilities[idx])) for label, idx in zip(labels, top_indices)]
+
+    def predict_from_keypoints(
+        self,
+        keypoints: np.ndarray,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> Tuple[str, float, List[Tuple[str, float]]]:
+        top_predictions = self.predict_top_k_from_keypoints(keypoints, top_k=top_k)
+        label, confidence = top_predictions[0]
+
+        if confidence < UNSURE_CONFIDENCE_THRESHOLD:
+            label = "UNSURE"
+
+        return label, confidence, top_predictions
+
+    def _predict_probabilities_with_tta(self, keypoints: np.ndarray) -> np.ndarray:
+        probs: List[np.ndarray] = []
+        for shift in TTA_FRAME_SHIFTS:
+            shifted = self._shift_sequence(keypoints, shift)
+            features = self._extract_features(shifted)
+            probs.append(self.model.predict_proba(features)[0])
+
+        return np.mean(np.stack(probs, axis=0), axis=0)
+
+    def predict_from_video(
+        self,
+        video_path: str | Path,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> Tuple[str, float, List[Tuple[str, float]]]:
         keypoints = self.extract_keypoints_from_video(video_path)
-        return self.predict_from_keypoints(keypoints)
+        return self.predict_from_keypoints(keypoints, top_k=top_k)
 
     @staticmethod
     def _hand_activity_ratio(keypoints: np.ndarray) -> float:
@@ -302,6 +336,24 @@ class SignTranslatorModel:
         indices = np.linspace(0, len(frames) - 1, target_len).astype(int)
         sampled = np.stack([frames[i] for i in indices]).astype(np.float32)
         return sampled
+
+    @staticmethod
+    def _shift_sequence(keypoints: np.ndarray, shift_frames: int) -> np.ndarray:
+        arr = np.array(keypoints, dtype=np.float32, copy=True)
+        if arr.shape != FEATURE_SHAPE:
+            raise ValueError(f"Expected keypoints shape {FEATURE_SHAPE}, got {arr.shape}")
+
+        shift = int(shift_frames)
+        if shift == 0:
+            return arr
+
+        if shift > 0:
+            pad = np.repeat(arr[:1], shift, axis=0)
+            return np.concatenate([pad, arr[:-shift]], axis=0)
+
+        trailing = abs(shift)
+        pad = np.repeat(arr[-1:], trailing, axis=0)
+        return np.concatenate([arr[trailing:], pad], axis=0)
 
     @staticmethod
     def _canonicalize_hands_order(frame_points: np.ndarray) -> np.ndarray:

@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -72,8 +72,26 @@ def train_model() -> dict:
 	}
 
 
+def _pack_prediction_response(
+	label: str,
+	confidence: float,
+	top_predictions: list[tuple[str, float]],
+) -> dict:
+	return {
+		"prediction": label,
+		"confidence": confidence,
+		"top_k": [
+			{"label": candidate_label, "confidence": candidate_confidence}
+			for candidate_label, candidate_confidence in top_predictions
+		],
+	}
+
+
 @app.post("/api/predict-video")
-async def predict_video(file: UploadFile = File(...)) -> dict:
+async def predict_video(
+	file: UploadFile = File(...),
+	top_k: int = Query(default=5, ge=1, le=10),
+) -> dict:
 	suffix = Path(file.filename or "video.webm").suffix or ".webm"
 
 	with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -82,18 +100,21 @@ async def predict_video(file: UploadFile = File(...)) -> dict:
 		tmp_path = Path(tmp.name)
 
 	try:
-		label, confidence = translator.predict_from_video(tmp_path)
+		label, confidence, top_predictions = translator.predict_from_video(tmp_path, top_k=top_k)
 	except Exception as exc:
 		raise HTTPException(status_code=400, detail=str(exc)) from exc
 	finally:
 		if tmp_path.exists():
 			tmp_path.unlink(missing_ok=True)
 
-	return {"prediction": label, "confidence": confidence}
+	return _pack_prediction_response(label, confidence, top_predictions)
 
 
 @app.post("/api/predict-keypoints")
-async def predict_keypoints(file: UploadFile = File(...)) -> dict:
+async def predict_keypoints(
+	file: UploadFile = File(...),
+	top_k: int = Query(default=5, ge=1, le=10),
+) -> dict:
 	if not (file.filename or "").endswith(".npy"):
 		raise HTTPException(status_code=400, detail="Upload a .npy file")
 
@@ -104,8 +125,9 @@ async def predict_keypoints(file: UploadFile = File(...)) -> dict:
 
 	try:
 		keypoints = np.load(tmp_path)
-		label, confidence = translator.predict_from_keypoints(
-			translator._coerce_shape(keypoints)
+		label, confidence, top_predictions = translator.predict_from_keypoints(
+			translator._coerce_shape(keypoints),
+			top_k=top_k,
 		)
 	except Exception as exc:
 		raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -113,7 +135,7 @@ async def predict_keypoints(file: UploadFile = File(...)) -> dict:
 		if tmp_path.exists():
 			tmp_path.unlink(missing_ok=True)
 
-	return {"prediction": label, "confidence": confidence}
+	return _pack_prediction_response(label, confidence, top_predictions)
 
 
 if __name__ == "__main__":
