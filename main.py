@@ -25,11 +25,15 @@ app.add_middleware(
 )
 
 translator = SignTranslatorModel(
-	annotations_path=BASE_DIR / "annotations.csv",
-	keypoints_dir=BASE_DIR / "slovo_keypoints",
-	model_path=BASE_DIR / "models" / "model.joblib",
-	encoder_path=BASE_DIR / "models" / "label_encoder.joblib",
+	annotations_path=BASE_DIR / "annotations.tsv",        # ← изменено с .csv на .tsv
+	keypoints_dir=BASE_DIR / "bukva_keypoints",           # ← изменено с slovo_keypoints
+	model_path=BASE_DIR / "models" / "bukva_model.pth",   # ← изменено с model.joblib
+	encoder_path=BASE_DIR / "models" / "bukva_encoder.joblib",  # ← изменено
 )
+
+# Загружаем модель при старте (если есть)
+translator.load_if_exists()
+print(f"Модель загружена. Доступно классов: {len(translator.label_encoder.classes_) if translator.label_encoder else 0}")
 
 assets_dir = FRONTEND_DIST_DIR / "assets"
 if assets_dir.exists():

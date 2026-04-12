@@ -16,29 +16,40 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-SEQUENCE_LENGTH = 155
+# ============================================
+# ПАРАМЕТРЫ ДЛЯ BUKVA (адаптированные)
+# ============================================
+SEQUENCE_LENGTH = 64  # trimmed видео короче (было 155)
 NUM_HANDS = 2
 NUM_LANDMARKS = 21
 NUM_COORDS = 3
 FEATURE_SHAPE = (SEQUENCE_LENGTH, NUM_HANDS, NUM_LANDMARKS, NUM_COORDS)
 MIN_HAND_ACTIVITY_RATIO = 0.01
-AUGMENT_REPEATS = 2
+AUGMENT_REPEATS = 3  # увеличена аугментация
 DEFAULT_TOP_K = 5
 MAX_TOP_K = 10
 UNSURE_CONFIDENCE_THRESHOLD = 0.20
-TTA_FRAME_SHIFTS = (-4, -2, 0, 2, 4)
+TTA_FRAME_SHIFTS = (-3, 0, 3)  # меньше сдвигов для коротких видео
 
-LSTM_HIDDEN_SIZE = 192
+# Гиперпараметры LSTM (оптимизированы для 33 классов)
+LSTM_HIDDEN_SIZE = 128
 LSTM_LAYERS = 2
-LSTM_DROPOUT = 0.25
-TRAIN_BATCH_SIZE = 48
-TRAIN_MAX_EPOCHS = 80
-TRAIN_PATIENCE = 10
+LSTM_DROPOUT = 0.3
+TRAIN_BATCH_SIZE = 32
+TRAIN_MAX_EPOCHS = 60
+TRAIN_PATIENCE = 8
 TRAIN_LR = 1e-3
 TRAIN_WEIGHT_DECAY = 1e-4
 VALIDATION_SIZE = 0.15
 TRAIN_LABEL_SMOOTHING = 0.05
 TRAIN_GRAD_CLIP_NORM = 1.0
+
+# Буквы русского алфавита (33 класса)
+RUSSIAN_LETTERS = [
+    'А', 'Б', 'В', 'Г', 'Д', 'Е', 'Ё', 'Ж', 'З', 'И', 'Й',
+    'К', 'Л', 'М', 'Н', 'О', 'П', 'Р', 'С', 'Т', 'У', 'Ф',
+    'Х', 'Ц', 'Ч', 'Ш', 'Щ', 'Ъ', 'Ы', 'Ь', 'Э', 'Ю', 'Я'
+]
 
 
 @dataclass
@@ -53,12 +64,12 @@ class TrainResult:
 
 class LSTMSequenceClassifier(nn.Module):
     def __init__(
-        self,
-        input_size: int,
-        hidden_size: int,
-        num_layers: int,
-        num_classes: int,
-        dropout: float,
+            self,
+            input_size: int,
+            hidden_size: int,
+            num_layers: int,
+            num_classes: int,
+            dropout: float,
     ) -> None:
         super().__init__()
         self.lstm = nn.LSTM(
@@ -88,11 +99,11 @@ class LSTMSequenceClassifier(nn.Module):
 
 class SignTranslatorModel:
     def __init__(
-        self,
-        annotations_path: str | Path = "annotations.csv",
-        keypoints_dir: str | Path = "slovo_keypoints",
-        model_path: str | Path = "models/model.joblib",
-        encoder_path: str | Path = "models/label_encoder.joblib",
+            self,
+            annotations_path: str | Path = "annotations.tsv",  # ← изменено для Bukva
+            keypoints_dir: str | Path = "bukva_keypoints",  # ← изменено для Bukva
+            model_path: str | Path = "models/bukva_model.pth",  # ← изменено
+            encoder_path: str | Path = "models/bukva_encoder.joblib",  # ← изменено
     ) -> None:
         self.annotations_path = Path(annotations_path)
         self.keypoints_dir = Path(keypoints_dir)
@@ -104,7 +115,7 @@ class SignTranslatorModel:
         self._feature_mean: np.ndarray | None = None
         self._feature_std: np.ndarray | None = None
         self._input_size: int | None = None
-        self._device = torch.device("cpu")
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self._mp_hands = mp.solutions.hands
 
@@ -140,6 +151,8 @@ class SignTranslatorModel:
         if len(X) < 10:
             raise ValueError("Too few samples found for training.")
 
+        print(f"📊 Загружено {len(X)} образцов, {len(np.unique(y_text))} классов")
+
         X_train_raw, X_test, y_train_text, y_test_text = train_test_split(
             X,
             y_text,
@@ -169,6 +182,10 @@ class SignTranslatorModel:
         y_train = label_encoder.transform(y_train_aug_text)
         y_test = label_encoder.transform(y_test_text)
 
+        num_classes = len(label_encoder.classes_)
+        print(f"🎯 Количество классов: {num_classes}")
+
+        # Нормализация признаков
         feature_mean = X_fit.reshape(-1, X_fit.shape[-1]).mean(axis=0).astype(np.float32)
         feature_std = X_fit.reshape(-1, X_fit.shape[-1]).std(axis=0).astype(np.float32)
         feature_std = np.where(feature_std < 1e-6, 1.0, feature_std).astype(np.float32)
@@ -178,7 +195,6 @@ class SignTranslatorModel:
         X_train_norm = ((X_train - feature_mean) / feature_std).astype(np.float32)
         X_test_norm = ((X_test - feature_mean) / feature_std).astype(np.float32)
 
-        num_classes = len(label_encoder.classes_)
         input_size = int(X_train_norm.shape[-1])
 
         model = LSTMSequenceClassifier(
@@ -189,6 +205,7 @@ class SignTranslatorModel:
             dropout=LSTM_DROPOUT,
         ).to(self._device)
 
+        # Веса классов для балансировки
         class_counts = np.bincount(y_fit, minlength=num_classes).astype(np.float32)
         class_counts = np.maximum(class_counts, 1.0)
         class_weights = class_counts.sum() / (num_classes * class_counts)
@@ -215,11 +232,17 @@ class SignTranslatorModel:
         X_val_tensor = torch.tensor(X_val_norm, dtype=torch.float32, device=self._device)
         y_val_tensor = torch.tensor(y_val, dtype=torch.long, device=self._device)
 
+        print(f"\n🚀 Начало обучения LSTM...")
+        print(f"   Train samples: {len(X_fit_norm)}")
+        print(f"   Val samples: {len(X_val_norm)}")
+        print(f"   Input size: {input_size}")
+        print(f"   Device: {self._device}\n")
+
         best_val_accuracy = -1.0
         best_state: dict | None = None
         epochs_without_improvement = 0
 
-        for _ in range(TRAIN_MAX_EPOCHS):
+        for epoch in range(TRAIN_MAX_EPOCHS):
             model.train()
             for batch_x, batch_y in fit_loader:
                 batch_x = batch_x.to(self._device)
@@ -244,9 +267,15 @@ class SignTranslatorModel:
                 best_val_accuracy = val_accuracy
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 epochs_without_improvement = 0
+                print(f"   Epoch {epoch + 1:3d} | Val Acc: {val_accuracy:.4f} ✨")
             else:
                 epochs_without_improvement += 1
+                if (epoch + 1) % 10 == 0:
+                    print(
+                        f"   Epoch {epoch + 1:3d} | Val Acc: {val_accuracy:.4f} (no improvement: {epochs_without_improvement})")
+
                 if epochs_without_improvement >= TRAIN_PATIENCE:
+                    print(f"\n⏹️ Early stopping at epoch {epoch + 1}")
                     break
 
         if best_state is None:
@@ -285,7 +314,7 @@ class SignTranslatorModel:
 
         return TrainResult(
             samples=len(X),
-            classes=len(label_encoder.classes_),
+            classes=num_classes,
             train_accuracy=float(train_accuracy),
             test_accuracy=float(test_accuracy),
             total_matched_samples=total_matched_samples,
@@ -293,9 +322,9 @@ class SignTranslatorModel:
         )
 
     def predict_top_k_from_keypoints(
-        self,
-        keypoints: np.ndarray,
-        top_k: int = DEFAULT_TOP_K,
+            self,
+            keypoints: np.ndarray,
+            top_k: int = DEFAULT_TOP_K,
     ) -> List[Tuple[str, float]]:
         self._ensure_loaded()
         self._ensure_has_hand_activity(keypoints)
@@ -308,9 +337,9 @@ class SignTranslatorModel:
         return [(str(label), float(probabilities[idx])) for label, idx in zip(labels, top_indices)]
 
     def predict_from_keypoints(
-        self,
-        keypoints: np.ndarray,
-        top_k: int = DEFAULT_TOP_K,
+            self,
+            keypoints: np.ndarray,
+            top_k: int = DEFAULT_TOP_K,
     ) -> Tuple[str, float, List[Tuple[str, float]]]:
         top_predictions = self.predict_top_k_from_keypoints(keypoints, top_k=top_k)
         label, confidence = top_predictions[0]
@@ -349,9 +378,9 @@ class SignTranslatorModel:
             return torch.argmax(logits, dim=1).cpu().numpy()
 
     def predict_from_video(
-        self,
-        video_path: str | Path,
-        top_k: int = DEFAULT_TOP_K,
+            self,
+            video_path: str | Path,
+            top_k: int = DEFAULT_TOP_K,
     ) -> Tuple[str, float, List[Tuple[str, float]]]:
         keypoints = self.extract_keypoints_from_video(video_path)
         return self.predict_from_keypoints(keypoints, top_k=top_k)
@@ -372,10 +401,10 @@ class SignTranslatorModel:
             )
 
     def extract_keypoints_from_video(
-        self,
-        video_path: str | Path,
-        start_frame: int | None = None,
-        end_frame: int | None = None,
+            self,
+            video_path: str | Path,
+            start_frame: int | None = None,
+            end_frame: int | None = None,
     ) -> np.ndarray:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -387,10 +416,10 @@ class SignTranslatorModel:
         raw_frames: List[np.ndarray] = []
 
         with self._mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=NUM_HANDS,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+                static_image_mode=False,
+                max_num_hands=NUM_HANDS,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
         ) as hands:
             while True:
                 if end_frame is not None:
@@ -442,10 +471,13 @@ class SignTranslatorModel:
 
             label = str(matches.iloc[0]["text"]).strip()
             label = label.upper()
-            
-            keypoints = np.load(npy_path)
 
-            # Align shape if needed.
+            # Фильтруем только буквы (для Bukva это все записи, но оставим для безопасности)
+            if label not in RUSSIAN_LETTERS:
+                skipped_non_letters += 1
+                continue
+
+            keypoints = np.load(npy_path)
             keypoints = self._coerce_shape(keypoints)
             X_list.append(self._extract_sequence_features(keypoints))
             y_list.append(label)
@@ -455,13 +487,16 @@ class SignTranslatorModel:
 
         X = np.array(X_list, dtype=np.float32)
         y = np.array(y_list)
+
+        print(f"📊 Загружено {len(X)} образцов для {len(np.unique(y))} букв")
+
         return X, y, total_matched_samples, skipped_non_letters
 
     @staticmethod
     def _augment_sequence_samples(
-        X: np.ndarray,
-        y: np.ndarray,
-        repeats: int = 4,
+            X: np.ndarray,
+            y: np.ndarray,
+            repeats: int = 4,
     ) -> Tuple[np.ndarray, np.ndarray]:
         if repeats <= 0:
             return X, y
@@ -482,16 +517,16 @@ class SignTranslatorModel:
             for sample_i, temporal_shift in enumerate(shifts):
                 shift = int(temporal_shift)
                 if shift > 0:
-                    pad = np.repeat(shifted[sample_i : sample_i + 1, :1, :], shift, axis=1)
-                    shifted[sample_i : sample_i + 1] = np.concatenate(
-                        [pad, shifted[sample_i : sample_i + 1, :-shift, :]],
+                    pad = np.repeat(shifted[sample_i:sample_i + 1, :1, :], shift, axis=1)
+                    shifted[sample_i:sample_i + 1] = np.concatenate(
+                        [pad, shifted[sample_i:sample_i + 1, :-shift, :]],
                         axis=1,
                     )
                 elif shift < 0:
                     trailing = abs(shift)
-                    pad = np.repeat(shifted[sample_i : sample_i + 1, -1:, :], trailing, axis=1)
-                    shifted[sample_i : sample_i + 1] = np.concatenate(
-                        [shifted[sample_i : sample_i + 1, trailing:, :], pad],
+                    pad = np.repeat(shifted[sample_i:sample_i + 1, -1:, :], trailing, axis=1)
+                    shifted[sample_i:sample_i + 1] = np.concatenate(
+                        [shifted[sample_i:sample_i + 1, trailing:, :], pad],
                         axis=1,
                     )
 
@@ -642,19 +677,12 @@ class SignTranslatorModel:
         vel_seq = velocity.reshape(velocity.shape[0], -1)
         return np.concatenate([seq, vel_seq], axis=1).astype(np.float32)
 
-    @staticmethod
-    def _flatten_keypoints(keypoints: np.ndarray) -> np.ndarray:
-        arr = np.array(keypoints, dtype=np.float32)
-        if arr.shape != FEATURE_SHAPE:
-            raise ValueError(f"Expected keypoints shape {FEATURE_SHAPE}, got {arr.shape}")
-        return arr.reshape(1, -1)
-
     def _ensure_loaded(self) -> None:
         if (
-            self.model is None
-            or self.label_encoder is None
-            or self._feature_mean is None
-            or self._feature_std is None
+                self.model is None
+                or self.label_encoder is None
+                or self._feature_mean is None
+                or self._feature_std is None
         ):
             if not self.load_if_exists():
                 raise ValueError(
@@ -670,8 +698,11 @@ def train_and_save_default() -> TrainResult:
 if __name__ == "__main__":
     result = train_and_save_default()
     print(
-        f"Training completed: samples={result.samples}, "
-        f"classes={result.classes}, "
-        f"train_acc={result.train_accuracy:.3f}, "
-        f"test_acc={result.test_accuracy:.3f}"
+        f"\n{'=' * 50}"
+        f"\n✅ Training completed!"
+        f"\n   Samples: {result.samples}"
+        f"\n   Classes: {result.classes}"
+        f"\n   Train accuracy: {result.train_accuracy:.3f}"
+        f"\n   Test accuracy: {result.test_accuracy:.3f}"
+        f"\n{'=' * 50}"
     )

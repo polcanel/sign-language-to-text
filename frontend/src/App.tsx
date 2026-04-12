@@ -183,9 +183,9 @@ export function App() {
           Train the model on slovo_keypoints dataset, then upload or record a clip to get text prediction.
         </p>
         <div className="status">Backend: {health?.status || "..."} | {statusLabel}</div>
-        <button className="button--accent" disabled={isTraining || isPredicting} onClick={() => void handleTrain()}>
-          {isTraining ? "Training model..." : "Train model"}
-        </button>
+        {/*<button className="button--accent" disabled={isTraining || isPredicting} onClick={() => void handleTrain()}>*/}
+        {/*  {isTraining ? "Training model..." : "Train model"}*/}
+        {/*</button>*/}
       </header>
 
       <section className="grid">
