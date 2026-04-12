@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, TensorDataset
 # ============================================
 # ПАРАМЕТРЫ ДЛЯ BUKVA (адаптированные)
 # ============================================
-SEQUENCE_LENGTH = 64  # trimmed видео короче (было 155)
+SEQUENCE_LENGTH = 64
 NUM_HANDS = 2
 NUM_LANDMARKS = 21
 NUM_COORDS = 3
@@ -100,10 +100,10 @@ class LSTMSequenceClassifier(nn.Module):
 class SignTranslatorModel:
     def __init__(
             self,
-            annotations_path: str | Path = "annotations.tsv",  # ← изменено для Bukva
-            keypoints_dir: str | Path = "bukva_keypoints",  # ← изменено для Bukva
-            model_path: str | Path = "models/bukva_model.pth",  # ← изменено
-            encoder_path: str | Path = "models/bukva_encoder.joblib",  # ← изменено
+            annotations_path: str | Path = "annotations.tsv",
+            keypoints_dir: str | Path = "bukva_keypoints",
+            model_path: str | Path = "models/bukva_model.pth",
+            encoder_path: str | Path = "models/bukva_encoder.joblib",
     ) -> None:
         self.annotations_path = Path(annotations_path)
         self.keypoints_dir = Path(keypoints_dir)
@@ -151,7 +151,7 @@ class SignTranslatorModel:
         if len(X) < 10:
             raise ValueError("Too few samples found for training.")
 
-        print(f"📊 Загружено {len(X)} образцов, {len(np.unique(y_text))} классов")
+        print(f"Загружено {len(X)} образцов, {len(np.unique(y_text))} классов")
 
         X_train_raw, X_test, y_train_text, y_test_text = train_test_split(
             X,
@@ -183,9 +183,8 @@ class SignTranslatorModel:
         y_test = label_encoder.transform(y_test_text)
 
         num_classes = len(label_encoder.classes_)
-        print(f"🎯 Количество классов: {num_classes}")
+        print(f"Количество классов: {num_classes}")
 
-        # Нормализация признаков
         feature_mean = X_fit.reshape(-1, X_fit.shape[-1]).mean(axis=0).astype(np.float32)
         feature_std = X_fit.reshape(-1, X_fit.shape[-1]).std(axis=0).astype(np.float32)
         feature_std = np.where(feature_std < 1e-6, 1.0, feature_std).astype(np.float32)
@@ -205,7 +204,6 @@ class SignTranslatorModel:
             dropout=LSTM_DROPOUT,
         ).to(self._device)
 
-        # Веса классов для балансировки
         class_counts = np.bincount(y_fit, minlength=num_classes).astype(np.float32)
         class_counts = np.maximum(class_counts, 1.0)
         class_weights = class_counts.sum() / (num_classes * class_counts)
@@ -232,7 +230,7 @@ class SignTranslatorModel:
         X_val_tensor = torch.tensor(X_val_norm, dtype=torch.float32, device=self._device)
         y_val_tensor = torch.tensor(y_val, dtype=torch.long, device=self._device)
 
-        print(f"\n🚀 Начало обучения LSTM...")
+        print(f"\nНачало обучения LSTM...")
         print(f"   Train samples: {len(X_fit_norm)}")
         print(f"   Val samples: {len(X_val_norm)}")
         print(f"   Input size: {input_size}")
@@ -267,7 +265,7 @@ class SignTranslatorModel:
                 best_val_accuracy = val_accuracy
                 best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 epochs_without_improvement = 0
-                print(f"   Epoch {epoch + 1:3d} | Val Acc: {val_accuracy:.4f} ✨")
+                print(f"   Epoch {epoch + 1:3d} | Val Acc: {val_accuracy:.4f}")
             else:
                 epochs_without_improvement += 1
                 if (epoch + 1) % 10 == 0:
@@ -275,7 +273,7 @@ class SignTranslatorModel:
                         f"   Epoch {epoch + 1:3d} | Val Acc: {val_accuracy:.4f} (no improvement: {epochs_without_improvement})")
 
                 if epochs_without_improvement >= TRAIN_PATIENCE:
-                    print(f"\n⏹️ Early stopping at epoch {epoch + 1}")
+                    print(f"\n⏹Early stopping at epoch {epoch + 1}")
                     break
 
         if best_state is None:
@@ -472,7 +470,6 @@ class SignTranslatorModel:
             label = str(matches.iloc[0]["text"]).strip()
             label = label.upper()
 
-            # Фильтруем только буквы (для Bukva это все записи, но оставим для безопасности)
             if label not in RUSSIAN_LETTERS:
                 skipped_non_letters += 1
                 continue
@@ -488,7 +485,7 @@ class SignTranslatorModel:
         X = np.array(X_list, dtype=np.float32)
         y = np.array(y_list)
 
-        print(f"📊 Загружено {len(X)} образцов для {len(np.unique(y))} букв")
+        print(f"Загружено {len(X)} образцов для {len(np.unique(y))} букв")
 
         return X, y, total_matched_samples, skipped_non_letters
 
@@ -699,7 +696,7 @@ if __name__ == "__main__":
     result = train_and_save_default()
     print(
         f"\n{'=' * 50}"
-        f"\n✅ Training completed!"
+        f"\nTraining completed!"
         f"\n   Samples: {result.samples}"
         f"\n   Classes: {result.classes}"
         f"\n   Train accuracy: {result.train_accuracy:.3f}"
