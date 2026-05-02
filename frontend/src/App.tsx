@@ -11,7 +11,6 @@ export function App() {
   const [isTraining, setIsTraining] = useState(false);
   const [isPredicting, setIsPredicting] = useState(false);
 
-  const [videoFile, setVideoFile] = useState<File | null>(null);
   const [recordingBlob, setRecordingBlob] = useState<Blob | null>(null);
   const [isCameraActive, setIsCameraActive] = useState(false);
 
@@ -56,14 +55,6 @@ export function App() {
     } finally {
       setIsTraining(false);
     }
-  }
-
-  async function handlePredictUpload(): Promise<void> {
-    if (!videoFile) {
-      setError("Choose a video file first.");
-      return;
-    }
-    await sendForPrediction(videoFile);
   }
 
   async function handlePredictRecording(): Promise<void> {
@@ -179,29 +170,10 @@ export function App() {
     <div className="page">
       <header className="hero">
         <h1>Sign Language to Text</h1>
-        <p>
-          Train the model on slovo_keypoints dataset, then upload or record a clip to get text prediction.
-        </p>
         <div className="status">Backend: {health?.status || "..."} | {statusLabel}</div>
-        {/*<button className="button--accent" disabled={isTraining || isPredicting} onClick={() => void handleTrain()}>*/}
-        {/*  {isTraining ? "Training model..." : "Train model"}*/}
-        {/*</button>*/}
       </header>
 
       <section className="grid">
-        <article className="card">
-          <h2>Upload Video</h2>
-          <p>Pick a sign video and send it to backend for inference.</p>
-          <input
-            type="file"
-            accept="video/*"
-            onChange={(event) => setVideoFile(event.target.files?.[0] || null)}
-          />
-          <button className="button--accent" disabled={isTraining || isPredicting} onClick={() => void handlePredictUpload()}>
-            {isPredicting ? "Processing..." : "Predict uploaded video"}
-          </button>
-        </article>
-
         <article className="card">
           <h2>Record Camera</h2>
           <p>Record 3 to 6 seconds of one gesture, then run prediction.</p>
@@ -229,35 +201,35 @@ export function App() {
             Predict recording
           </button>
         </article>
-      </section>
 
-      {result && (
-        <section className="result">
-          <div className="resultTitle">Result</div>
-          <div>{result.prediction}</div>
-          <div>
-            {result.prediction.startsWith("✓ Model trained") ? "Test accuracy" : "Confidence"}: {(result.confidence * 100).toFixed(1)}%
-          </div>
-          {!!result.top_k?.length && !result.prediction.startsWith("✓ Model trained") && (
-            <div className="topKList">
-              {result.top_k.map((candidate, index) => (
-                <div key={`${candidate.label}-${index}`} className="topKRow">
-                  <div className="topKMeta">
-                    <span>#{index + 1} {candidate.label}</span>
-                    <span>{(candidate.confidence * 100).toFixed(1)}%</span>
-                  </div>
-                  <div className="topKBarTrack">
-                    <div
-                      className="topKBarFill"
-                      style={{ width: `${Math.max(2, candidate.confidence * 100)}%` }}
-                    />
-                  </div>
-                </div>
-              ))}
+        {result && (
+          <article className="card result-card">
+            <div className="resultTitle">Result</div>
+            <div>{result.prediction}</div>
+            <div>
+              {result.prediction.startsWith("✓ Model trained") ? "Test accuracy" : "Confidence"}: {(result.confidence * 100).toFixed(1)}%
             </div>
-          )}
-        </section>
-      )}
+            {!!result.top_k?.length && !result.prediction.startsWith("✓ Model trained") && (
+              <div className="topKList">
+                {result.top_k.map((candidate, index) => (
+                  <div key={`${candidate.label}-${index}`} className="topKRow">
+                    <div className="topKMeta">
+                      <span>#{index + 1} {candidate.label}</span>
+                      <span>{(candidate.confidence * 100).toFixed(1)}%</span>
+                    </div>
+                    <div className="topKBarTrack">
+                      <div
+                        className="topKBarFill"
+                        style={{ width: `${Math.max(2, candidate.confidence * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </article>
+        )}
+      </section>
 
       {error && <section className="error">{error}</section>}
     </div>
